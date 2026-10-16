@@ -103,15 +103,49 @@ fn neonatom_eval_uses_bounded_fuel_and_is_deterministic() {
         root.join("index.db"),
     );
     let result = dispatcher
-        .execute_read_only(ToolRequest::NeonAtomEval {
-            source: "1 + 2 * 3".into(),
-        })
+        .execute_read_only_for_task(
+            ToolRequest::NeonAtomEval {
+                source: "1 + 2 * 3".into(),
+            },
+            "Hitung nilai ekspresi 1 + 2 * 3.",
+        )
         .unwrap();
     assert_eq!(result.text, "7");
-    let expensive = dispatcher.execute_read_only(ToolRequest::NeonAtomEval {
-        source: "sum(range(0, 1000000))".into(),
-    });
+    let expensive = dispatcher.execute_read_only_for_task(
+        ToolRequest::NeonAtomEval {
+            source: "sum(range(0, 1000000))".into(),
+        },
+        "Hitung jumlah nilai dalam range 0 sampai 1000000, termasuk 1000000.",
+    );
     assert!(expensive.is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn neonatom_dispatch_requires_eligible_task_context() {
+    let root = temp_dir("atom-policy");
+    let dispatcher = ToolDispatcher::new(
+        Workspace::open(root.clone()).unwrap(),
+        root.join("index.db"),
+    );
+    let request = || ToolRequest::NeonAtomEval {
+        source: "1 + 2".into(),
+    };
+    assert!(dispatcher.execute_read_only(request()).is_err());
+    assert!(dispatcher
+        .execute_read_only_for_task(request(), "Jelaskan konsep ownership di Rust.")
+        .is_err());
+    assert!(dispatcher
+        .execute_read_only_for_task(request(), "Jumlah bilangan 1 sampai 10.")
+        .unwrap_err()
+        .contains("clarification required"));
+    let result = dispatcher
+        .execute_read_only_for_task(
+            request(),
+            "Hitung jumlah bilangan 1 sampai 10, termasuk 10.",
+        )
+        .unwrap();
+    assert_eq!(result.text, "3");
     let _ = fs::remove_dir_all(root);
 }
 

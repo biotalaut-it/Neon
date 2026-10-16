@@ -1,3 +1,4 @@
+use crate::agent::AgentRole;
 use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
@@ -22,12 +23,14 @@ pub struct ModelConfig {
 }
 impl ModelConfig {
     pub fn from_env() -> Result<Self, String> {
+        Self::from_env_for_role(None)
+    }
+
+    pub fn from_env_for_role(role: Option<AgentRole>) -> Result<Self, String> {
         let server_bin = std::env::var_os("NEON_LLAMA_SERVER")
             .map(PathBuf::from)
             .ok_or("NEON_LLAMA_SERVER must point to llama-server")?;
-        let model_path = std::env::var_os("NEON_MODEL_PATH")
-            .map(PathBuf::from)
-            .ok_or("NEON_MODEL_PATH must point to a local GGUF file")?;
+        let model_path = resolve_model_path(role)?;
         let port = parse_env("NEON_PORT", 8089u16)?;
         let context_tokens = parse_env("NEON_CONTEXT", 4096u32)?;
         let threads = parse_env(
@@ -58,6 +61,41 @@ impl ModelConfig {
             max_response_bytes: 4 * 1024 * 1024,
         })
     }
+}
+
+fn resolve_model_path(role: Option<AgentRole>) -> Result<PathBuf, String> {
+    let candidates: Vec<&str> = match role {
+        Some(AgentRole::Leader) => vec!["NEON_MODEL_LEADER", "NEON_MODEL_PATH"],
+        Some(AgentRole::Programmer) => vec![
+            "NEON_MODEL_SUSAN",
+            "NEON_MODEL_PROGRAMMER",
+            "NEON_MODEL_PATH",
+        ],
+        Some(AgentRole::Maintenance) => vec!["NEON_MODEL_FANI", "NEON_MODEL_PATH"],
+        Some(AgentRole::Debugger) => vec!["NEON_MODEL_DEBY", "NEON_MODEL_PATH"],
+        Some(AgentRole::Decomposer) => vec!["NEON_MODEL_DYOR", "NEON_MODEL_PATH"],
+        Some(AgentRole::Router) => vec!["NEON_MODEL_MIKE", "NEON_MODEL_PATH"],
+        Some(AgentRole::Summarizer) => vec!["NEON_MODEL_JORDAN", "NEON_MODEL_PATH"],
+        None => vec!["NEON_MODEL_PATH"],
+    };
+
+    for name in candidates {
+        if let Some(value) = std::env::var_os(name) {
+            let path = PathBuf::from(value);
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            return Ok(path);
+        }
+    }
+
+    Err(match role {
+        Some(role) => format!(
+            "{} model not configured; set NEON_MODEL_PATH or a role-specific override like NEON_MODEL_SUSAN",
+            role.display_name()
+        ),
+        None => "NEON_MODEL_PATH must point to a local GGUF file".to_string(),
+    })
 }
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
     match std::env::var(name) {
@@ -267,13 +305,55 @@ fn complete_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_at, ChatMessage};
+    use super::{complete_at, ChatMessage, ModelConfig};
+    use crate::agent::AgentRole;
     use std::{
+        env,
         io::{Read, Write},
         net::TcpListener,
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn role_specific_model_override_uses_susan_model_when_present() {
+        let default_path = "/tmp/default-model.gguf";
+        let susan_path = "/tmp/qwen2.5-coder-3b.gguf";
+
+        unsafe {
+            env::set_var("NEON_LLAMA_SERVER", "/tmp/llama-server");
+            env::set_var("NEON_MODEL_PATH", default_path);
+            env::set_var("NEON_MODEL_SUSAN", susan_path);
+        }
+
+        let cfg = ModelConfig::from_env_for_role(Some(AgentRole::Programmer)).unwrap();
+        assert_eq!(cfg.model_path.to_string_lossy(), susan_path);
+
+        unsafe {
+            env::remove_var("NEON_MODEL_SUSAN");
+            env::remove_var("NEON_MODEL_PATH");
+            env::remove_var("NEON_LLAMA_SERVER");
+        }
+    }
+
+    #[test]
+    fn role_specific_model_falls_back_to_default_model_when_no_override_is_set() {
+        let default_path = "/tmp/default-model.gguf";
+
+        unsafe {
+            env::set_var("NEON_LLAMA_SERVER", "/tmp/llama-server");
+            env::set_var("NEON_MODEL_PATH", default_path);
+            env::remove_var("NEON_MODEL_SUSAN");
+        }
+
+        let cfg = ModelConfig::from_env_for_role(Some(AgentRole::Maintenance)).unwrap();
+        assert_eq!(cfg.model_path.to_string_lossy(), default_path);
+
+        unsafe {
+            env::remove_var("NEON_MODEL_PATH");
+            env::remove_var("NEON_LLAMA_SERVER");
+        }
+    }
 
     fn serve_once(status: u16, body: &'static str) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

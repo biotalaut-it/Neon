@@ -84,7 +84,45 @@ Memori pengguna hanya retrieval lokal dan eksplisit, bukan pelatihan bobot model
 
 Build Android belum dijalankan pada perangkat Termux fisik di sesi ini; keberhasilan tes Linux tidak menjamin semua kombinasi Android/llama.cpp/model kompatibel. Jika build gagal pada ponsel, simpan pesan error lengkap untuk diagnosis.
 
-## Perintah
+## Quick start untuk pengembangan
+
+### Model per role (siap untuk Susan)
+
+Untuk mempersiapkan Susan memakai model khusus Qwen 2.5 3B Coder, Anda bisa menyiapkan override per role sambil tetap membiarkan default model untuk role lain.
+
+```bash
+cp .env.example .env
+# lalu sesuaikan path berikut:
+# export NEON_MODEL_SUSAN="$HOME/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+# export NEON_MODEL_PATH="$HOME/models/default-model.gguf"
+```
+
+Aturan prioritas model saat ini:
+
+- `NEON_MODEL_SUSAN` / `NEON_MODEL_PROGRAMMER` dipakai untuk Susan jika di-set
+- jika tidak ada override, sistem akan memakai `NEON_MODEL_PATH`
+- role lain bisa diisi nanti dengan `NEON_MODEL_FANI`, `NEON_MODEL_DEBY`, `NEON_MODEL_DYOR`, `NEON_MODEL_MIKE`, `NEON_MODEL_JORDAN`
+
+### Build dan validasi cepat
+
+```bash
+cargo test --workspace
+cargo build --release --workspace
+cargo run -p neon -- --help
+```
+
+### Shortcut repo
+
+```bash
+make help
+make test
+make build
+make run
+make install
+./scripts/verify.sh
+```
+
+### Perintah
 
 ```text
 neon chat

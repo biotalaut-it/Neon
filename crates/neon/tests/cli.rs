@@ -118,7 +118,7 @@ fn persistent_plan_runs_allowlisted_read_only_steps_without_model_configuration(
     let mut store = TaskStore::open(&data.join("neon.sqlite3")).unwrap();
     let plan_id = store
         .create_plan(
-            "Read and calculate",
+            "Read and calculate 2 + 2",
             vec![
                 NewPlanStep {
                     title: "Read guide".into(),
@@ -131,7 +131,7 @@ fn persistent_plan_runs_allowlisted_read_only_steps_without_model_configuration(
                 },
                 NewPlanStep {
                     title: "Calculate".into(),
-                    instruction: "Add two and two".into(),
+                    instruction: "Calculate 2 + 2".into(),
                     tool: ToolRequest::NeonAtomEval {
                         source: "2 + 2".into(),
                     },

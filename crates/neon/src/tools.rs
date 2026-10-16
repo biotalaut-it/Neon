@@ -1,4 +1,5 @@
 use crate::{
+    agent::router::TaskIntent,
     knowledge::KnowledgeIndex,
     lab::{ChangeDiff, Workspace},
 };
@@ -30,6 +31,78 @@ pub enum ToolRequest {
     WorkspaceProposeWrite { path: String, content: String },
     CargoTest,
     CargoCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NeonAtomPolicy {
+    Eligible,
+    Ineligible,
+    NeedsClarification(String),
+}
+
+pub fn neonatom_policy(task: &str) -> Result<NeonAtomPolicy, String> {
+    let lower = task.to_ascii_lowercase();
+    let has_natural_range = lower.contains("sampai") || lower.contains("hingga");
+    let has_explicit_boundary = lower.contains("inklusif")
+        || lower.contains("eksklusif")
+        || lower.contains("termasuk")
+        || lower.contains("sebelum")
+        || lower.contains("tidak menghitung")
+        || lower.contains("ikut dihitung");
+    let numeric_count = lower.chars().filter(char::is_ascii_digit).count();
+    if has_natural_range && numeric_count > 0 && !has_explicit_boundary {
+        return Ok(NeonAtomPolicy::NeedsClarification(
+            "Batas rentang belum jelas: apakah angka akhirnya ikut dihitung?".into(),
+        ));
+    }
+
+    let intent = TaskIntent::classify(task).map_err(|e| e.to_string())?;
+    if intent != TaskIntent::Compute {
+        return Ok(NeonAtomPolicy::Ineligible);
+    }
+
+    let has_numeric_signal = numeric_count > 0;
+    let has_operation_signal = lower.contains("range")
+        || lower.contains("map")
+        || lower.contains("filter")
+        || lower.contains("take")
+        || lower.contains("sum")
+        || lower.contains("kuadrat")
+        || lower.contains("jumlah")
+        || lower.contains("total")
+        || lower.contains("hitung")
+        || lower.contains("compute")
+        || lower.contains("calculate")
+        || lower.contains("+")
+        || lower.contains("-")
+        || lower.contains("*")
+        || lower.contains("/")
+        || lower.contains("%")
+        || lower.contains("=");
+    let has_unsupported_signal = lower.contains("rust")
+        || lower.contains("kode")
+        || lower.contains("code")
+        || lower.contains("debug")
+        || lower.contains("bug")
+        || lower.contains("file")
+        || lower.contains("network")
+        || lower.contains("web")
+        || lower.contains("shell")
+        || lower.contains("git");
+    if has_unsupported_signal || !has_numeric_signal || !has_operation_signal {
+        return Ok(NeonAtomPolicy::Ineligible);
+    }
+    Ok(NeonAtomPolicy::Eligible)
+}
+
+pub fn should_use_neonatom(task: &str) -> Result<bool, String> {
+    match neonatom_policy(task)? {
+        NeonAtomPolicy::Eligible => Ok(true),
+        NeonAtomPolicy::Ineligible => Ok(false),
+        NeonAtomPolicy::NeedsClarification(question) => {
+            Err(format!("clarification required: {question}"))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -257,6 +330,34 @@ impl ToolDispatcher {
     }
 
     pub fn execute_read_only(&self, request: ToolRequest) -> Result<ToolResult, String> {
+        if matches!(&request, ToolRequest::NeonAtomEval { .. }) {
+            return Err("NeonAtom evaluation requires the user's task context".into());
+        }
+        self.execute_read_only_validated(request)
+    }
+
+    pub fn execute_read_only_for_task(
+        &self,
+        request: ToolRequest,
+        task: &str,
+    ) -> Result<ToolResult, String> {
+        if matches!(&request, ToolRequest::NeonAtomEval { .. }) {
+            match neonatom_policy(task)? {
+                NeonAtomPolicy::Eligible => {}
+                NeonAtomPolicy::Ineligible => {
+                    return Err(
+                        "NeonAtom is only allowed for clear, supported compute tasks".into(),
+                    )
+                }
+                NeonAtomPolicy::NeedsClarification(question) => {
+                    return Err(format!("clarification required: {question}"))
+                }
+            }
+        }
+        self.execute_read_only_validated(request)
+    }
+
+    fn execute_read_only_validated(&self, request: ToolRequest) -> Result<ToolResult, String> {
         request.validate()?;
         match request {
             ToolRequest::WorkspaceList => {

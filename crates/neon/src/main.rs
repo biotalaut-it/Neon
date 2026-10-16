@@ -251,6 +251,19 @@ fn confirm(prompt: &str) -> Result<bool, String> {
         "y" | "yes"
     ))
 }
+fn read_clarification(prompt: &str) -> Result<String, String> {
+    print!("{prompt} ");
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    let answer = answer.trim();
+    if answer.is_empty() || answer.len() > 512 {
+        return Err("clarification must contain 1..=512 bytes".into());
+    }
+    Ok(answer.to_string())
+}
 fn memory_command(args: &[String]) -> Result<(), String> {
     let mut memory = MemoryStore::open(&data_dir()?.join("neon.sqlite3"))?;
     match args.first().map(String::as_str) {
@@ -599,7 +612,26 @@ fn run_plan(plan_id: i64, db: &Path) -> Result<(), String> {
             step.acceptance,
             step.tool.to_json()?
         );
-        let proposal = dispatcher.execute_read_only(step.tool.clone())?;
+        let task_context = format!("{}\n{}\n{}", initial.goal, step.title, step.instruction);
+        let proposal = match dispatcher.execute_read_only_for_task(step.tool.clone(), &task_context)
+        {
+            Err(error) if error.starts_with("clarification required:") => {
+                let question = error.trim_start_matches("clarification required:").trim();
+                let answer = read_clarification(&format!(
+                    "Klarifikasi diperlukan: {question} Jawab 'ikut' atau 'tidak ikut'."
+                ))?;
+                let boundary = match answer.to_ascii_lowercase().as_str() {
+                    "ya" | "y" | "iya" | "ikut" | "termasuk" => "batas akhir termasuk",
+                    "tidak" | "t" | "tidak ikut" | "tidak termasuk" | "eksklusif" => {
+                        "batas akhir tidak termasuk"
+                    }
+                    _ => return Err("jawab 'ikut' atau 'tidak ikut' untuk batas akhir".into()),
+                };
+                let clarified_task = format!("{task_context}\nKlarifikasi pengguna: {boundary}");
+                dispatcher.execute_read_only_for_task(step.tool.clone(), &clarified_task)?
+            }
+            result => result?,
+        };
         let result = if proposal.effect == ToolEffect::NeedsApproval {
             println!("Tool proposal:\n{}", proposal.text);
             if let Some(diff) = &proposal.change {
