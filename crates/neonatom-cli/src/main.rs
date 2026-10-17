@@ -1,4 +1,8 @@
-use neonatom::{eval, parse, Limits, Value};
+use neonatom::{
+    runtime::eval,
+    syntax::{parse, Limits},
+    value::Value,
+};
 use std::{
     env, fs,
     io::{self, Write},

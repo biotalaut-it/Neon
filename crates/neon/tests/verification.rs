@@ -1,6 +1,9 @@
 use neon::{
     tools::{ToolEffect, ToolRequest, ToolResult},
-    verification::{EvidenceKind, VerificationEngine, VerificationStatus},
+    verification::{
+        ConfidenceAction, ConfidenceEngine, EvidenceKind, VerificationEngine, VerificationEvidence,
+        VerificationStatus,
+    },
 };
 fn result(
     exit_code: Option<i32>,
@@ -61,4 +64,43 @@ fn model_prose_is_not_an_input_to_the_verification_engine() {
     );
     assert_eq!(evidence.status, VerificationStatus::Failed);
     assert!(!evidence.summary.contains("passed"));
+}
+
+#[test]
+fn confidence_uses_only_recorded_verified_or_failed_evidence() {
+    let evidence = |status| VerificationEvidence {
+        kind: EvidenceKind::CommandExit,
+        status,
+        summary: "recorded test result".into(),
+        source: "cargo test".into(),
+        exit_code: None,
+        recorded_at: 1,
+        truncated: false,
+    };
+    let empty = ConfidenceEngine::estimate(&[]);
+    assert_eq!(empty.lower_bound, None);
+    assert_eq!(
+        ConfidenceEngine::next_step(empty, 0.8),
+        ConfidenceAction::AskForEvidence
+    );
+    let estimate = ConfidenceEngine::estimate(&[
+        evidence(VerificationStatus::Verified),
+        evidence(VerificationStatus::Verified),
+        evidence(VerificationStatus::Failed),
+        evidence(VerificationStatus::NotRun),
+    ]);
+    assert_eq!(estimate.verified, 2);
+    assert_eq!(estimate.failed, 1);
+    assert_eq!(estimate.not_run, 1);
+    assert!(estimate
+        .lower_bound
+        .is_some_and(|score| (0.0..0.67).contains(&score)));
+    assert_eq!(
+        ConfidenceEngine::next_step(estimate, 0.8),
+        ConfidenceAction::TryAlternateMethod
+    );
+    assert_eq!(
+        ConfidenceEngine::next_step(estimate, f32::NAN),
+        ConfidenceAction::AskForEvidence
+    );
 }

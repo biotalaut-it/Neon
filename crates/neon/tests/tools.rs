@@ -32,6 +32,14 @@ fn tool_parser_rejects_unknown_fields_unknown_tools_and_oversized_payloads() {
     )
     .is_ok());
     assert!(ToolRequest::parse_json(
+        r#"{"tool":"knowledge_graph","arguments":{"query":"symbol","max_depth":2}}"#
+    )
+    .is_ok());
+    assert!(ToolRequest::parse_json(
+        r#"{"tool":"knowledge_graph","arguments":{"query":"symbol","max_depth":9}}"#
+    )
+    .is_err());
+    assert!(ToolRequest::parse_json(
         r#"{"tool":"workspace_read","arguments":{"path":"a","extra":true}}"#
     )
     .is_err());
@@ -199,6 +207,36 @@ fn cargo_request_is_only_a_proposal_until_an_approval_token_is_supplied() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn approved_cargo_check_runs_in_networkless_sandbox() {
+    let root = temp_dir("sandbox-cargo");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"sandbox-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"sandbox-check\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let dispatcher = ToolDispatcher::new(
+        Workspace::open(root.clone()).unwrap(),
+        root.join("index.db"),
+    );
+    let approval = neon::tools::UserApproval::from_terminal(true).unwrap();
+    let result = dispatcher
+        .execute_approved_cargo(ToolRequest::CargoCheck, &approval)
+        .unwrap();
+    assert_eq!(result.exit_code, Some(0), "{}", result.text);
+    assert!(!root.join("target").exists());
+    assert!(root.join("src/main.rs").is_file());
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn symbol_and_dependency_tools_use_real_local_rust_index() {
     let root = temp_dir("codebase-tools");
@@ -234,5 +272,50 @@ fn symbol_and_dependency_tools_use_real_local_rust_index() {
         "{}",
         dependencies.text
     );
+    let graph = dispatcher
+        .execute_read_only(ToolRequest::KnowledgeGraph {
+            query: "neon_tool_symbol".into(),
+            max_depth: 2,
+        })
+        .unwrap();
+    assert!(graph.text.contains("module_name.rs"), "{}", graph.text);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plugin_alias_dispatch_requires_enabled_registry_target_and_permission() {
+    use neon::plugins::{PluginManifest, PluginPermission, PluginRegistry, PluginTool};
+    let root = temp_dir("plugin-dispatch");
+    fs::write(root.join("notes.txt"), "private workspace note").unwrap();
+    let db = root.join("neon.sqlite3");
+    let mut registry = PluginRegistry::open(&db).unwrap();
+    registry
+        .register(&PluginManifest {
+            id: "reader".into(),
+            version: "1.0.0".into(),
+            api_version: neon::plugins::NEON_PLUGIN_API_VERSION.into(),
+            permissions: vec![PluginPermission::WorkspaceRead],
+            tools: vec![PluginTool {
+                name: "read-note".into(),
+                target_tool: "workspace_read".into(),
+            }],
+        })
+        .unwrap();
+    let dispatcher = ToolDispatcher::new(Workspace::open(root.clone()).unwrap(), db.clone());
+    let request = ToolRequest::WorkspaceRead {
+        path: "notes.txt".into(),
+    };
+    assert!(dispatcher
+        .execute_plugin_tool("reader", "read-note", request.clone(), "read")
+        .is_err());
+    registry.set_enabled("reader", true).unwrap();
+    let result = dispatcher
+        .execute_plugin_tool("reader", "read-note", request, "read")
+        .unwrap();
+    assert_eq!(result.text, "private workspace note");
+    assert!(dispatcher
+        .execute_plugin_tool("reader", "read-note", ToolRequest::GitStatus, "read")
+        .is_err());
+    drop(registry);
     let _ = fs::remove_dir_all(root);
 }

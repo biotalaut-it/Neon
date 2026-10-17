@@ -54,3 +54,12 @@ pub struct DependencyHit {
     pub kind: String,
     pub line: u32,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyGraphHit {
+    pub from_path: std::path::PathBuf,
+    pub target: String,
+    pub resolved_path: Option<std::path::PathBuf>,
+    pub kind: String,
+    pub line: u32,
+    pub depth: usize,
+}

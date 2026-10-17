@@ -1,10 +1,12 @@
 use super::{
     model::{ChatMessage, LocalModel, ModelError},
-    router::{Router, TaskPacket},
+    router::{AdaptiveReasoning, ReasoningMode, Router, TaskPacket},
     AgentPacket, AgentRole, PacketStatus,
 };
 use neonatom::{
-    eval as eval_neonatom, parse as parse_neonatom, Limits as AtomLimits, Value as AtomValue,
+    runtime::eval as eval_neonatom,
+    syntax::{parse as parse_neonatom, Limits as AtomLimits},
+    value::Value as AtomValue,
 };
 use serde::Deserialize;
 use std::time::Duration;
@@ -55,6 +57,26 @@ impl Supervisor {
             return Err(ModelError(
                 "agent input and memory exceed configured context byte budget".into(),
             ));
+        }
+        if AdaptiveReasoning::choose(input) == ReasoningMode::Direct {
+            let mut calls = 0;
+            let packet = run_packet(
+                model,
+                AgentRole::Leader,
+                input,
+                &context,
+                &mut calls,
+                &budget,
+            )?;
+            let answer = packet
+                .result
+                .ok_or_else(|| ModelError("Leader returned no answer".into()))?;
+            return Ok(AgentResponse {
+                answer,
+                roles_used: vec![AgentRole::Leader],
+                calls_used: calls,
+                evidence: Vec::new(),
+            });
         }
         let task = TaskPacket {
             task: input.to_string(),
@@ -178,7 +200,7 @@ impl Supervisor {
             &[
                 ChatMessage {
                     role: "system".into(),
-                    content: "Kamu Dyor, perencana tugas NEON. Hasilkan hanya JSON valid, tanpa markdown, dengan bentuk {\"goal\":string,\"steps\":[{\"title\":string,\"instruction\":string,\"tool\":{\"tool\":string,\"arguments\":object},\"depends_on\":[integer],\"acceptance\":string}]}. Buat 2 sampai 8 langkah berurutan, depends_on berisi indeks langkah sebelumnya mulai 0. Tool yang diizinkan: workspace_list(arguments:{}), workspace_read({path}), workspace_search({query}), symbols_search({query}), dependencies_search({query}), git_status({}), git_diff({}), neonatom_eval({source}), workspace_propose_write({path,content}), cargo_test({}), cargo_check({}). Jangan buat tool lain, jangan sertakan field approval/command bebas/URL. Semua path harus relatif di workspace. Operasi penulisan dan cargo hanya proposal; manusia akan diminta persetujuan saat eksekusi. Jangan sertakan tool pencarian web; pencarian DuckDuckGo harus diminta langsung oleh pengguna.".into(),
+                    content: "Kamu Dyor, perencana tugas NEON. Hasilkan hanya JSON valid, tanpa markdown, dengan bentuk {\"goal\":string,\"steps\":[{\"title\":string,\"instruction\":string,\"tool\":{\"tool\":string,\"arguments\":object},\"depends_on\":[integer],\"acceptance\":string}]}. Buat 2 sampai 8 langkah berurutan, depends_on berisi indeks langkah sebelumnya mulai 0. Tool yang diizinkan: workspace_list(arguments:{}), workspace_read({path}), workspace_search({query}), symbols_search({query}), dependencies_search({query}), knowledge_graph({query,max_depth}), git_status({}), git_diff({}), neonatom_eval({source}), workspace_propose_write({path,content}), cargo_test({}), cargo_check({}). Jangan buat tool lain, jangan sertakan field approval/command bebas/URL. Semua path harus relatif di workspace. Operasi penulisan dan cargo hanya proposal; manusia akan diminta persetujuan saat eksekusi. Jangan sertakan tool pencarian web; pencarian DuckDuckGo harus diminta langsung oleh pengguna.".into(),
                 },
                 ChatMessage { role: "user".into(), content: goal.trim().to_string() },
             ],

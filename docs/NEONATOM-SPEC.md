@@ -10,7 +10,7 @@ NeonAtom adalah bahasa pemrograman kecil berbasis Rust untuk mendeskripsikan pol
 - Ekspresi integer 64-bit bertanda, boolean, string terbatas, let-binding, fungsi murni terbatas, rentang lazy, generator aritmetika, dan transformasi stream.
 - CLI dapat menghitung ringkasan ukuran/count/checksum atau menulis output secara chunked dengan batas jumlah byte/elemen dan konfirmasi. Tanpa batas eksplisit, program tidak boleh mengmaterialisasi stream tak terbatas.
 - Batas default: fuel 1.000.000 langkah, nesting 128, input source 1 MiB, output materialized 16 MiB, waktu eksekusi 2 detik yang dapat dikonfigurasi; semua overflow/error dilaporkan.
-- Library API untuk integrasi NEON: `parse(source: &str) -> Result<Program, Diagnostic>`, `eval(program: &Program, limits: Limits) -> Result<Value, RuntimeError>`, `Stream::take(n)` dan iterator lazy terbatas.
+- API library mengikuti modul tanggung jawab: `neonatom::syntax::{parse, check, Program, Expr, Limits, Diagnostic}`, `neonatom::runtime::{eval, eval_with_context}`, dan `neonatom::value::{Value, Stream}`. API root-level tidak lagi me-re-export item tersebut; consumer harus menyebut submodul eksplisit. `Stream::take(n)` dan iterator tetap lazy serta terbatas.
 
 ## Sintaks inti yang direncanakan
 `let` binding, literal dan operasi aritmetika/logika, lambda murni satu-argumen `x => expr`, `range(start, end)`, `map(stream, lambda)`, `filter(stream, lambda)`, `take(stream, n)`, `sum(stream)`, `count(stream)`, `checksum(stream)`, `print(value)`. Definisi fungsi bernama tidak termasuk v0.1. Jangan menambahkan I/O sistem, import jaringan, reflection, eval dinamis, atau akses shell.

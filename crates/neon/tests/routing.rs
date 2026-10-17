@@ -1,5 +1,11 @@
 use neon::{
-    agent::{route_categories, router::TaskIntent, AgentRole},
+    agent::{
+        route_categories,
+        router::{
+            AdaptiveReasoning, HybridIntelligenceRouter, ModelRoute, ReasoningMode, TaskIntent,
+        },
+        AgentRole,
+    },
     tools::{neonatom_policy, should_use_neonatom, NeonAtomPolicy},
 };
 
@@ -34,6 +40,42 @@ fn compute_tasks_are_recognized_separately_from_agent_routing() {
     assert_eq!(
         TaskIntent::classify("Jelaskan apa itu ownership di Rust.").unwrap(),
         TaskIntent::General
+    );
+}
+
+#[test]
+fn adaptive_reasoning_uses_direct_path_only_for_simple_general_requests() {
+    assert_eq!(
+        AdaptiveReasoning::choose("Apa arti ownership?"),
+        ReasoningMode::Direct
+    );
+    assert_eq!(
+        AdaptiveReasoning::choose("Tolong perbaiki bug parser Rust."),
+        ReasoningMode::Analyze
+    );
+    assert_eq!(
+        AdaptiveReasoning::choose("Cari fungsi parser di repo."),
+        ReasoningMode::Search
+    );
+    assert_eq!(
+        AdaptiveReasoning::choose("Tolong test perubahan parser."),
+        ReasoningMode::Test
+    );
+}
+
+#[test]
+fn hybrid_router_requires_explicit_consent_and_only_offloads_analysis() {
+    assert_eq!(
+        HybridIntelligenceRouter::choose("Perbaiki bug pada parser Rust.", false),
+        ModelRoute::Local
+    );
+    assert_eq!(
+        HybridIntelligenceRouter::choose("Perbaiki bug pada parser Rust.", true),
+        ModelRoute::Remote
+    );
+    assert_eq!(
+        HybridIntelligenceRouter::choose("Apa arti ownership?", true),
+        ModelRoute::Local
     );
 }
 

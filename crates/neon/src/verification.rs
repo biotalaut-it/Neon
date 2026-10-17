@@ -29,6 +29,66 @@ pub struct VerificationEvidence {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfidenceEstimate {
+    pub verified: usize,
+    pub failed: usize,
+    pub not_run: usize,
+    pub lower_bound: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfidenceAction {
+    Accept,
+    AskForEvidence,
+    TryAlternateMethod,
+}
+
+pub struct ConfidenceEngine;
+impl ConfidenceEngine {
+    pub fn estimate(evidence: &[VerificationEvidence]) -> ConfidenceEstimate {
+        let verified = evidence
+            .iter()
+            .filter(|item| item.status == VerificationStatus::Verified)
+            .count();
+        let failed = evidence
+            .iter()
+            .filter(|item| item.status == VerificationStatus::Failed)
+            .count();
+        let not_run = evidence
+            .iter()
+            .filter(|item| item.status == VerificationStatus::NotRun)
+            .count();
+        let samples = verified + failed;
+        let lower_bound = (samples > 0).then(|| {
+            let n = samples as f64;
+            let rate = verified as f64 / n;
+            let z = 1.96_f64;
+            let denominator = 1.0 + z * z / n;
+            let center = rate + z * z / (2.0 * n);
+            let margin = z * (rate * (1.0 - rate) / n + z * z / (4.0 * n * n)).sqrt();
+            ((center - margin) / denominator).clamp(0.0, 1.0) as f32
+        });
+        ConfidenceEstimate {
+            verified,
+            failed,
+            not_run,
+            lower_bound,
+        }
+    }
+
+    pub fn next_step(estimate: ConfidenceEstimate, minimum_confidence: f32) -> ConfidenceAction {
+        if !minimum_confidence.is_finite() || !(0.0..=1.0).contains(&minimum_confidence) {
+            return ConfidenceAction::AskForEvidence;
+        }
+        match estimate.lower_bound {
+            None => ConfidenceAction::AskForEvidence,
+            Some(score) if score >= minimum_confidence => ConfidenceAction::Accept,
+            Some(_) => ConfidenceAction::TryAlternateMethod,
+        }
+    }
+}
+
 pub struct VerificationEngine;
 impl VerificationEngine {
     pub fn verify_tool_result(request: &ToolRequest, result: &ToolResult) -> VerificationEvidence {

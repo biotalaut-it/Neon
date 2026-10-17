@@ -12,6 +12,73 @@ pub enum TaskIntent {
     General,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningMode {
+    Direct,
+    Analyze,
+    Search,
+    Test,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRoute {
+    Local,
+    Remote,
+}
+
+pub struct HybridIntelligenceRouter;
+impl HybridIntelligenceRouter {
+    pub fn choose(task: &str, explicit_remote_consent: bool) -> ModelRoute {
+        if explicit_remote_consent && AdaptiveReasoning::choose(task) == ReasoningMode::Analyze {
+            ModelRoute::Remote
+        } else {
+            ModelRoute::Local
+        }
+    }
+}
+
+pub struct AdaptiveReasoning;
+impl AdaptiveReasoning {
+    pub fn choose(task: &str) -> ReasoningMode {
+        let task = task.to_ascii_lowercase();
+        let asks_to_test = ["test", "tes ", "uji", "verifikasi", "compile", "kompilasi"]
+            .iter()
+            .any(|signal| task.contains(signal));
+        if asks_to_test {
+            return ReasoningMode::Test;
+        }
+        let asks_to_search = [
+            "cari ",
+            "search ",
+            "temukan ",
+            "find ",
+            "di repo",
+            "di codebase",
+        ]
+        .iter()
+        .any(|signal| task.contains(signal));
+        if asks_to_search {
+            return ReasoningMode::Search;
+        }
+        let intent = TaskIntent::classify(&task).unwrap_or(TaskIntent::General);
+        if matches!(intent, TaskIntent::Coding | TaskIntent::Debugging)
+            || task.len() > 400
+            || [
+                "langkah demi langkah",
+                "analisis",
+                "bandingkan",
+                "rencanakan",
+            ]
+            .iter()
+            .any(|signal| task.contains(signal))
+        {
+            ReasoningMode::Analyze
+        } else {
+            ReasoningMode::Direct
+        }
+    }
+}
+
 impl TaskIntent {
     pub fn classify(task: &str) -> Result<Self, ModelError> {
         let task = task.to_ascii_lowercase();

@@ -4,7 +4,7 @@ use super::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -195,6 +195,136 @@ impl KnowledgeIndex {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
     }
+
+    pub fn trace_dependency_graph(
+        &self,
+        query: &str,
+        max_depth: usize,
+        max_edges: usize,
+    ) -> Result<Vec<super::DependencyGraphHit>, String> {
+        if !(1..=8).contains(&max_depth) {
+            return Err("knowledge graph depth must be in 1..=8".into());
+        }
+        if !(1..=200).contains(&max_edges) {
+            return Err("knowledge graph edge limit must be in 1..=200".into());
+        }
+        let mut seeds = self
+            .search_symbols(query, 20)?
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect::<HashSet<_>>();
+        if seeds.is_empty() {
+            seeds.extend(
+                self.search_dependencies(query, 20)?
+                    .into_iter()
+                    .map(|hit| hit.from_path),
+            );
+        }
+        let indexed_paths = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT path FROM knowledge_files")
+                .map_err(|error| error.to_string())?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            paths
+        };
+        let mut queue = seeds
+            .iter()
+            .cloned()
+            .map(|path| (path, 0usize))
+            .collect::<VecDeque<_>>();
+        let mut visited = seeds;
+        let mut graph = Vec::new();
+        while let Some((from_path, depth)) = queue.pop_front() {
+            if depth >= max_depth || graph.len() >= max_edges {
+                continue;
+            }
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT to_name,kind,line FROM dependencies WHERE from_path=?1 ORDER BY line",
+                )
+                .map_err(|error| error.to_string())?;
+            let dependencies = statement
+                .query_map([from_path.to_string_lossy().as_ref()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            for (target, kind, line) in dependencies {
+                let resolved_path =
+                    resolve_dependency_path(&from_path, &target, &kind, &indexed_paths);
+                graph.push(super::DependencyGraphHit {
+                    from_path: from_path.clone(),
+                    target,
+                    resolved_path: resolved_path.clone(),
+                    kind,
+                    line,
+                    depth: depth + 1,
+                });
+                if graph.len() >= max_edges {
+                    break;
+                }
+                if let Some(path) = resolved_path {
+                    if depth + 1 < max_depth && visited.insert(path.clone()) {
+                        queue.push_back((path, depth + 1));
+                    }
+                }
+            }
+        }
+        Ok(graph)
+    }
+}
+
+fn resolve_dependency_path(
+    from_path: &Path,
+    target: &str,
+    kind: &str,
+    indexed_paths: &HashSet<String>,
+) -> Option<PathBuf> {
+    let source_parent = from_path.parent().unwrap_or_else(|| Path::new(""));
+    let mut segments = target
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|segment| !segment.is_empty() && *segment != "use")
+        .collect::<Vec<_>>();
+    let mut base = source_parent.to_path_buf();
+    match segments.first().copied() {
+        Some("crate") => {
+            segments.remove(0);
+        }
+        Some("self") => {
+            segments.remove(0);
+        }
+        Some("super") => {
+            segments.remove(0);
+            base.pop();
+        }
+        _ => {}
+    }
+    if kind == "mod" {
+        segments.truncate(1);
+    }
+    for count in (1..=segments.len()).rev() {
+        let module = segments[..count].join("/");
+        let file_candidate = base.join(format!("{module}.rs"));
+        if indexed_paths.contains(&file_candidate.to_string_lossy().into_owned()) {
+            return Some(file_candidate);
+        }
+        let directory_candidate = base.join(&module).join("mod.rs");
+        if indexed_paths.contains(&directory_candidate.to_string_lossy().into_owned()) {
+            return Some(directory_candidate);
+        }
+    }
+    None
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {

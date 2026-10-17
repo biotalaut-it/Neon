@@ -151,6 +151,131 @@ pub struct LocalModel {
     max_response_bytes: usize,
     context_tokens: u32,
 }
+
+pub struct RemoteModel {
+    client: reqwest::blocking::Client,
+    endpoint: String,
+    model: String,
+    api_key: zeroize::Zeroizing<String>,
+    max_response_bytes: usize,
+}
+impl RemoteModel {
+    pub fn new(endpoint: &str, model: &str, api_key: &str) -> Result<Self, ModelError> {
+        validate_remote_endpoint(endpoint)?;
+        if model.trim().is_empty() || model.len() > 128 {
+            return Err(ModelError(
+                "NEON_REMOTE_MODEL must contain 1..=128 bytes".into(),
+            ));
+        }
+        if api_key.is_empty() || api_key.len() > 4096 {
+            return Err(ModelError(
+                "NEON_REMOTE_API_KEY must contain 1..=4096 bytes".into(),
+            ));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                ModelError(format!("cannot configure remote model client: {error}"))
+            })?;
+        Ok(Self {
+            client,
+            endpoint: format!("{}/v1/chat/completions", endpoint.trim_end_matches('/')),
+            model: model.into(),
+            api_key: zeroize::Zeroizing::new(api_key.into()),
+            max_response_bytes: 4 * 1024 * 1024,
+        })
+    }
+
+    pub fn complete(
+        &self,
+        messages: &[ChatMessage],
+        max_tokens: u32,
+    ) -> Result<Completion, ModelError> {
+        if !(1..=32768).contains(&max_tokens) {
+            return Err(ModelError("max_tokens must be in 1..=32768".into()));
+        }
+        let prompt_bytes = messages
+            .iter()
+            .map(|message| message.content.len().saturating_add(message.role.len()))
+            .sum::<usize>();
+        if prompt_bytes > 64 * 1024 {
+            return Err(ModelError("remote prompt exceeds 64 KiB limit".into()));
+        }
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(self.api_key.as_str())
+            .json(&serde_json::json!({
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "stream": false,
+                "temperature": 0.2
+            }))
+            .send()
+            .map_err(|error| ModelError(format!("remote model request failed: {error}")))?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        response
+            .take(self.max_response_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| ModelError(format!("cannot read remote model response: {error}")))?;
+        if bytes.len() > self.max_response_bytes {
+            return Err(ModelError("remote model response exceeds 4 MiB".into()));
+        }
+        if !status.is_success() {
+            return Err(ModelError(format!("remote model returned HTTP {status}")));
+        }
+        let decoded: ChatResponse = serde_json::from_slice(&bytes)
+            .map_err(|error| ModelError(format!("invalid remote model response: {error}")))?;
+        let choice = decoded
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| ModelError("remote model returned no choices".into()))?;
+        Ok(Completion {
+            text: choice.message.content,
+            prompt_tokens: decoded.usage.as_ref().and_then(|usage| usage.prompt_tokens),
+            completion_tokens: decoded.usage.and_then(|usage| usage.completion_tokens),
+        })
+    }
+}
+
+fn validate_remote_endpoint(endpoint: &str) -> Result<(), ModelError> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|error| ModelError(format!("invalid NEON_REMOTE_URL: {error}")))?;
+    let secure = url.scheme() == "https";
+    let local_http = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            if host == "localhost" {
+                return true;
+            }
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host.parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+        });
+    if !secure && !local_http {
+        return Err(ModelError(
+            "remote endpoint must use HTTPS; HTTP is allowed only for loopback".into(),
+        ));
+    }
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || url.username() != ""
+        || url.password().is_some()
+    {
+        return Err(ModelError(
+            "remote endpoint must not include credentials, query, or fragment".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl LocalModel {
     pub fn start(config: &ModelConfig) -> Result<Self, ModelError> {
         if !config.host.is_loopback() {
@@ -233,6 +358,31 @@ impl LocalModel {
             max_tokens,
         )
     }
+
+    pub fn process_memory_kib(&self) -> Option<(u64, u64)> {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).ok()?;
+        parse_process_memory_kib(&status)
+    }
+}
+
+fn parse_process_memory_kib(status: &str) -> Option<(u64, u64)> {
+    let mut resident = None;
+    let mut peak = None;
+    for line in status.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !matches!(name, "VmRSS" | "VmHWM") {
+            continue;
+        }
+        let value = value.split_whitespace().next()?.parse::<u64>().ok()?;
+        match name {
+            "VmRSS" => resident = Some(value),
+            "VmHWM" => peak = Some(value),
+            _ => unreachable!(),
+        }
+    }
+    Some((resident?, peak?))
 }
 impl Drop for LocalModel {
     fn drop(&mut self) {
@@ -305,7 +455,9 @@ fn complete_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_at, ChatMessage, ModelConfig};
+    use super::{
+        complete_at, parse_process_memory_kib, validate_remote_endpoint, ChatMessage, ModelConfig,
+    };
     use crate::agent::AgentRole;
     use std::{
         env,
@@ -447,5 +599,21 @@ mod tests {
         let error =
             complete_at(&client, "http://127.0.0.1:1", 1024, 4096, &messages, 768).unwrap_err();
         assert!(error.to_string().contains("conservative context budget"));
+    }
+
+    #[test]
+    fn remote_endpoint_requires_tls_or_loopback_and_rejects_embedded_secrets() {
+        assert!(validate_remote_endpoint("https://models.example/api").is_ok());
+        assert!(validate_remote_endpoint("http://127.0.0.1:8080").is_ok());
+        assert!(validate_remote_endpoint("http://[::1]:8080").is_ok());
+        assert!(validate_remote_endpoint("http://models.example").is_err());
+        assert!(validate_remote_endpoint("https://user:secret@models.example").is_err());
+    }
+
+    #[test]
+    fn process_memory_parser_ignores_non_numeric_proc_fields() {
+        let status = "Name:\tllama-server\nVmPeak:\t900 kB\nVmHWM:\t256 kB\nVmRSS:\t128 kB\n";
+        assert_eq!(parse_process_memory_kib(status), Some((128, 256)));
+        assert_eq!(parse_process_memory_kib("Name:\tllama-server\n"), None);
     }
 }

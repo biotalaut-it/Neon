@@ -75,3 +75,38 @@ fn invalid_rust_remains_full_text_searchable_without_symbols_and_stale_symbols_d
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(db.parent().unwrap());
 }
+
+#[test]
+fn dependency_graph_traverses_resolved_rust_modules_with_depth_limits() {
+    let root = temp_dir("graph");
+    let db = temp_dir("graph-db").join("neon.db");
+    fs::write(
+        root.join("lib.rs"),
+        "mod module_name;\npub fn graph_root_anchor() {}\n",
+    )
+    .unwrap();
+    fs::write(root.join("module_name.rs"), "mod nested;\n").unwrap();
+    fs::write(root.join("nested.rs"), "pub fn nested_target() {}\n").unwrap();
+    let index = KnowledgeIndex::open(&db).unwrap();
+    index.reindex(&root, &limits()).unwrap();
+
+    let graph = index
+        .trace_dependency_graph("graph_root_anchor", 2, 20)
+        .unwrap();
+    assert!(graph.iter().any(|edge| {
+        edge.from_path == Path::new("lib.rs")
+            && edge.resolved_path.as_deref() == Some(Path::new("module_name.rs"))
+            && edge.depth == 1
+    }));
+    assert!(graph.iter().any(|edge| {
+        edge.from_path == Path::new("module_name.rs")
+            && edge.resolved_path.as_deref() == Some(Path::new("nested.rs"))
+            && edge.depth == 2
+    }));
+    assert!(index
+        .trace_dependency_graph("graph_root_anchor", 9, 20)
+        .is_err());
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(db.parent().unwrap());
+}

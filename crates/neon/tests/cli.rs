@@ -43,7 +43,12 @@ fn local_knowledge_and_symbol_commands_work_without_model_or_internet() {
         "A local reference mentions quasar-protocol.",
     )
     .unwrap();
-    fs::write(workspace.join("src/lib.rs"), "pub fn build_neon() {}\n").unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub mod api;\npub fn build_neon() {}\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/api.rs"), "pub fn local_api() {}\n").unwrap();
     let invoke = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_neon"))
             .args(args)
@@ -65,7 +70,70 @@ fn local_knowledge_and_symbol_commands_work_without_model_or_internet() {
     let symbols = invoke(&["symbols", "search", "build_neon"]);
     assert!(symbols.status.success());
     assert!(
-        String::from_utf8_lossy(&symbols.stdout).contains("src/lib.rs:1 function fn build_neon")
+        String::from_utf8_lossy(&symbols.stdout).contains("src/lib.rs:2 function fn build_neon")
+    );
+    let graph = invoke(&["knowledge", "graph", "api", "2"]);
+    assert!(graph.status.success());
+    assert!(
+        String::from_utf8_lossy(&graph.stdout).contains("src/api.rs"),
+        "{}",
+        String::from_utf8_lossy(&graph.stdout)
+    );
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn confidence_cli_requests_real_evidence_for_a_plan_with_no_test_results() {
+    use neon::{
+        planner::{NewPlanStep, TaskStore},
+        tools::ToolRequest,
+    };
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base =
+        std::env::temp_dir().join(format!("neon-cli-confidence-{}-{id}", std::process::id()));
+    let data = base.join("data");
+    fs::create_dir_all(&data).unwrap();
+    let mut store = TaskStore::open(&data.join("neon.sqlite3")).unwrap();
+    let plan_id = store
+        .create_plan(
+            "Await a real test",
+            vec![
+                NewPlanStep {
+                    title: "Inspect".into(),
+                    instruction: "Read status".into(),
+                    tool: ToolRequest::GitStatus,
+                    depends_on: vec![],
+                    acceptance: "Status is returned".into(),
+                },
+                NewPlanStep {
+                    title: "Run test".into(),
+                    instruction: "Run Cargo test".into(),
+                    tool: ToolRequest::CargoTest,
+                    depends_on: vec![0],
+                    acceptance: "A real process exits zero".into(),
+                },
+            ],
+        )
+        .unwrap();
+    drop(store);
+    let output = Command::new(env!("CARGO_BIN_EXE_neon"))
+        .args(["confidence", &plan_id.to_string()])
+        .env("NEON_DATA_DIR", &data)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Confidence not calibrated"), "{stdout}");
+    assert!(
+        stdout.contains("obtain a real test/check result"),
+        "{stdout}"
     );
     let _ = fs::remove_dir_all(base);
 }

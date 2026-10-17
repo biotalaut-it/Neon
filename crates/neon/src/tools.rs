@@ -2,8 +2,13 @@ use crate::{
     agent::router::TaskIntent,
     knowledge::KnowledgeIndex,
     lab::{ChangeDiff, Workspace},
+    plugins::{permission_for_target, PluginRegistry},
 };
-use neonatom::{eval, parse, Limits as AtomLimits, Value as AtomValue};
+use neonatom::{
+    runtime::eval,
+    syntax::{parse, Limits as AtomLimits},
+    value::Value as AtomValue,
+};
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
     fs,
@@ -24,6 +29,7 @@ pub enum ToolRequest {
     WorkspaceSearch { query: String },
     SymbolsSearch { query: String },
     DependenciesSearch { query: String },
+    KnowledgeGraph { query: String, max_depth: usize },
     GitStatus,
     GitDiff,
     NeonAtomEval { source: String },
@@ -126,6 +132,12 @@ struct QueryArgs {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GraphArgs {
+    query: String,
+    max_depth: usize,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceArgs {
     source: String,
 }
@@ -137,6 +149,24 @@ struct WriteArgs {
 }
 
 impl ToolRequest {
+    pub fn tool_name(&self) -> &'static str {
+        match self {
+            Self::WorkspaceList => "workspace_list",
+            Self::WorkspaceRead { .. } => "workspace_read",
+            Self::WorkspaceSearch { .. } => "workspace_search",
+            Self::SymbolsSearch { .. } => "symbols_search",
+            Self::DependenciesSearch { .. } => "dependencies_search",
+            Self::KnowledgeGraph { .. } => "knowledge_graph",
+            Self::GitStatus => "git_status",
+            Self::GitDiff => "git_diff",
+            Self::NeonAtomEval { .. } => "neonatom_eval",
+            Self::DuckDuckGoSearch { .. } => "duckduckgo_search",
+            Self::WorkspaceProposeWrite { .. } => "workspace_propose_write",
+            Self::CargoTest => "cargo_test",
+            Self::CargoCheck => "cargo_check",
+        }
+    }
+
     pub fn parse_json(input: &str) -> Result<Self, String> {
         if input.len() > MAX_REQUEST_BYTES {
             return Err("tool JSON exceeds 8 KiB".into());
@@ -163,6 +193,13 @@ impl ToolRequest {
             "dependencies_search" => {
                 let args: QueryArgs = parse_args(envelope.arguments)?;
                 Self::DependenciesSearch { query: args.query }
+            }
+            "knowledge_graph" => {
+                let args: GraphArgs = parse_args(envelope.arguments)?;
+                Self::KnowledgeGraph {
+                    query: args.query,
+                    max_depth: args.max_depth,
+                }
             }
             "git_status" => {
                 let _: EmptyArgs = parse_args(envelope.arguments)?;
@@ -214,6 +251,10 @@ impl ToolRequest {
             Self::DependenciesSearch { query } => {
                 ("dependencies_search", serde_json::json!({"query":query}))
             }
+            Self::KnowledgeGraph { query, max_depth } => (
+                "knowledge_graph",
+                serde_json::json!({"query":query,"max_depth":max_depth}),
+            ),
             Self::GitStatus => ("git_status", serde_json::json!({})),
             Self::GitDiff => ("git_diff", serde_json::json!({})),
             Self::NeonAtomEval { source } => {
@@ -263,6 +304,12 @@ impl ToolRequest {
             | Self::SymbolsSearch { query }
             | Self::DependenciesSearch { query }
             | Self::DuckDuckGoSearch { query } => validate_text(query, "query", 2048)?,
+            Self::KnowledgeGraph { query, max_depth } => {
+                validate_text(query, "query", 2048)?;
+                if !(1..=8).contains(max_depth) {
+                    return Err("knowledge graph depth must be in 1..=8".into());
+                }
+            }
             Self::NeonAtomEval { source } => validate_text(source, "NeonAtom source", 4096)?,
             _ => {}
         }
@@ -357,6 +404,26 @@ impl ToolDispatcher {
         self.execute_read_only_validated(request)
     }
 
+    pub fn execute_plugin_tool(
+        &self,
+        plugin_id: &str,
+        alias: &str,
+        request: ToolRequest,
+        task: &str,
+    ) -> Result<ToolResult, String> {
+        let registry = PluginRegistry::open(&self.knowledge_db)?;
+        let Some((target, permissions)) = registry.resolve_tool(plugin_id, alias)? else {
+            return Err("plugin is disabled or tool alias was not registered".into());
+        };
+        if target != request.tool_name() {
+            return Err("plugin alias target does not match the typed tool request".into());
+        }
+        if !permissions.contains(&permission_for_target(&target)) {
+            return Err("plugin does not have the permission required by this tool".into());
+        }
+        self.execute_read_only_for_task(request, task)
+    }
+
     fn execute_read_only_validated(&self, request: ToolRequest) -> Result<ToolResult, String> {
         request.validate()?;
         match request {
@@ -427,6 +494,28 @@ impl ToolDispatcher {
                                 edge.line,
                                 edge.kind,
                                 edge.to_name
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
+            }
+            ToolRequest::KnowledgeGraph { query, max_depth } => {
+                let index = KnowledgeIndex::open(&self.knowledge_db)?;
+                let graph = index.trace_dependency_graph(&query, max_depth, 100)?;
+                Ok(ToolResult::read_only(
+                    graph
+                        .into_iter()
+                        .map(|edge| {
+                            format!(
+                                "{}:{} depth={} {} -> {}",
+                                edge.from_path.display(),
+                                edge.line,
+                                edge.depth,
+                                edge.kind,
+                                edge.resolved_path
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| format!("{} (unresolved)", edge.target))
                             )
                         })
                         .collect::<Vec<_>>()
@@ -521,15 +610,13 @@ impl ToolDispatcher {
         _approval: &UserApproval,
     ) -> Result<ToolResult, String> {
         match request {
-            ToolRequest::CargoTest => run_allowlisted(
-                "cargo",
+            ToolRequest::CargoTest => run_sandboxed_cargo(
                 &["test", "--workspace"],
                 self.workspace.root(),
                 Duration::from_secs(120),
                 ToolEffect::Applied,
             ),
-            ToolRequest::CargoCheck => run_allowlisted(
-                "cargo",
+            ToolRequest::CargoCheck => run_sandboxed_cargo(
                 &["check", "--workspace"],
                 self.workspace.root(),
                 Duration::from_secs(120),
@@ -571,9 +658,179 @@ fn run_allowlisted(
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE");
     }
+    run_command(command, timeout, effect)
+}
+
+fn run_sandboxed_cargo(
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+    effect: ToolEffect,
+) -> Result<ToolResult, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (args, cwd, timeout, effect);
+        Err("sandboxed Cargo execution requires Linux namespaces and bubblewrap".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        run_sandboxed_program("cargo", args, cwd, timeout, effect)
+    }
+}
+
+fn run_sandboxed_program(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+    effect: ToolEffect,
+) -> Result<ToolResult, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, args, cwd, timeout, effect);
+        return Err("sandboxed execution requires Linux namespaces and bubblewrap".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let bwrap = Path::new("/usr/bin/bwrap");
+        let prlimit = Path::new("/usr/bin/prlimit");
+        if !bwrap.is_file() || !prlimit.is_file() {
+            return Err(
+                "sandbox unavailable: install bubblewrap and prlimit; command not run".into(),
+            );
+        }
+        let workspace = cwd
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve sandbox workspace: {error}"))?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or("HOME is required for sandboxed Cargo")?;
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cargo"));
+        let rustup_home = std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".rustup"));
+        let registry = cargo_home.join("registry");
+        let cargo_bin = cargo_home.join("bin");
+        if !registry.is_dir() || !cargo_bin.is_dir() || !rustup_home.is_dir() {
+            return Err(
+                "sandboxed Cargo requires cached crates and an installed Rust toolchain".into(),
+            );
+        }
+        let mut sandbox_args = vec![
+            "--die-with-parent".to_string(),
+            "--unshare-user".to_string(),
+            "--unshare-pid".to_string(),
+            "--unshare-net".to_string(),
+        ];
+        for path in ["/usr", "/bin", "/lib", "/lib64"] {
+            if Path::new(path).exists() {
+                sandbox_args.extend(["--ro-bind".into(), path.into(), path.into()]);
+            }
+        }
+        sandbox_args.extend([
+            "--dev".into(),
+            "/dev".into(),
+            "--proc".into(),
+            "/proc".into(),
+            "--size".into(),
+            "536870912".into(),
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--dir".into(),
+            "/tmp/home".into(),
+            "--dir".into(),
+            "/tmp/cargo".into(),
+            "--dir".into(),
+            "/tmp/cargo/registry".into(),
+            "--dir".into(),
+            "/tmp/target".into(),
+            "--ro-bind".into(),
+            registry.to_string_lossy().into_owned(),
+            "/tmp/cargo/registry".into(),
+            "--dir".into(),
+            "/opt".into(),
+            "--dir".into(),
+            "/opt/rustup".into(),
+            "--ro-bind".into(),
+            rustup_home.to_string_lossy().into_owned(),
+            "/opt/rustup".into(),
+            "--dir".into(),
+            "/tools".into(),
+            "--ro-bind".into(),
+            cargo_bin.to_string_lossy().into_owned(),
+            "/tools".into(),
+            "--dir".into(),
+            "/workspace".into(),
+            "--ro-bind".into(),
+            workspace.to_string_lossy().into_owned(),
+            "/workspace".into(),
+            "--chdir".into(),
+            "/workspace".into(),
+            "--setenv".into(),
+            "HOME".into(),
+            "/tmp/home".into(),
+            "--setenv".into(),
+            "CARGO_HOME".into(),
+            "/tmp/cargo".into(),
+            "--setenv".into(),
+            "RUSTUP_HOME".into(),
+            "/opt/rustup".into(),
+            "--setenv".into(),
+            "CARGO_TARGET_DIR".into(),
+            "/tmp/target".into(),
+            "--setenv".into(),
+            "CARGO_NET_OFFLINE".into(),
+            "true".into(),
+            "--setenv".into(),
+            "CARGO_BUILD_JOBS".into(),
+            "2".into(),
+            "--setenv".into(),
+            "PATH".into(),
+            "/tools:/usr/bin:/bin".into(),
+            "--".into(),
+            match program {
+                "cargo" => "/tools/cargo".to_string(),
+                _ => return Err("sandbox executor rejected a non-Cargo command".into()),
+            },
+        ]);
+        sandbox_args.extend(args.iter().map(|argument| (*argument).to_string()));
+        sandbox_args.push("--locked".into());
+        let mut command = Command::new(prlimit);
+        command
+            .args([
+                "--as=4294967296",
+                "--cpu=180",
+                "--fsize=1073741824",
+                "--nofile=256",
+                "--nproc=512",
+                "--",
+            ])
+            .arg(bwrap)
+            .args(sandbox_args)
+            .current_dir(&workspace)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        run_command(command, timeout, effect)
+    }
+}
+
+fn run_command(
+    mut command: Command,
+    timeout: Duration,
+    effect: ToolEffect,
+) -> Result<ToolResult, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
-        .map_err(|e| format!("cannot start allowlisted {program}: {e}"))?;
+        .map_err(|e| format!("cannot start bounded tool process: {e}"))?;
     let stdout = child.stdout.take().ok_or("cannot capture tool stdout")?;
     let stderr = child.stderr.take().ok_or("cannot capture tool stderr")?;
     let out_thread = thread::spawn(move || drain_pipe(stdout, MAX_OUTPUT_BYTES / 2));
@@ -589,6 +846,10 @@ fn run_allowlisted(
         }
         if started.elapsed() >= timeout {
             timed_out = true;
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -653,5 +914,29 @@ mod tests {
         assert_eq!(value["tool"], "workspace_read");
         assert_eq!(value["arguments"]["path"], "src/lib.rs");
         assert!(ToolRequest::parse_json(&json).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_process_kills_descendants_in_its_process_group() {
+        use super::{run_command, ToolEffect};
+        use std::{
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let started = Instant::now();
+        let result = run_command(
+            {
+                let mut command = Command::new("sh");
+                command.args(["-c", "sleep 5 & wait"]);
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                command
+            },
+            Duration::from_millis(100),
+            ToolEffect::Applied,
+        )
+        .unwrap();
+        assert!(result.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

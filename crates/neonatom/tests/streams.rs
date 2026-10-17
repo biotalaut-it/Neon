@@ -1,4 +1,8 @@
-use neonatom::{eval, parse, Limits, RuntimeErrorKind, Value};
+use neonatom::{
+    runtime::eval,
+    syntax::{parse, Limits, RuntimeErrorKind},
+    value::Value,
+};
 use std::time::Duration;
 
 fn limits() -> Limits {
